@@ -31,7 +31,7 @@ marston.core> (time (frequencies (map status (pmap (fn [x] (battle IMP DWARF)) (
 
 ## License
 
-Copyright © 2014 FIXME
+Copyright © 2014 Greg Hawkins
 
 Distributed under the Eclipse Public License either version 1.0 or (at
 your option) any later version.
