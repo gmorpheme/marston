@@ -21,12 +21,13 @@ limit and parallelises cleanly. Of course, not all battles go the
 distance so this is shoddy benchmarking...
 
 ```clojure
-marston.core> (time (frequencies (map status (take 100 (repeatedly (fn [] (battle IMP DWARF)))))))
-"Elapsed time: 28856.231407 msecs"
-{[:drawn] 57, [:won "dwarf"] 43}
+marston.core>  (time (frequencies (map status (take 100 (repeatedly (fn [] (battle IMP DWARF)))))))
+"Elapsed time: 43235.078962 msecs"
+{[:drawn] 76, [:won "dwarf"] 24}
 marston.core> (time (frequencies (map status (pmap (fn [x] (battle IMP DWARF)) (range 100)))))
-"Elapsed time: 8359.896126 msecs"
-{[:drawn] 68, [:won "dwarf"] 32}
+"Elapsed time: 11706.437191 msecs"
+{[:drawn] 79, [:won "dwarf"] 21}
+marston.core> 
 ```
 
 ## License

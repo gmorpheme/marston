@@ -91,7 +91,8 @@ modifer defaults to :I, modes to :$."
                 separation
                 warriors
                 writelimit]} coredesc]
-    {:core (vec (repeat coresize initial))
+    {:core (vec (repeat coresize nil)) ; intialise to nil and lazily
+                                       ; to :initial
      :coredesc coredesc
      :process-queue {}
      :cycle 0}))
@@ -105,6 +106,8 @@ modifer defaults to :I, modes to :$."
         [:drawn]
         [:ongoing]))))
 
+
+
 (def metrics
   "Returns mod arithmetic functions based on the coredesc. e.g.
 `(let [[read-wrap write-wrap shift decrement increment] (metrics (:coredesc state))] ...)`"
@@ -115,6 +118,14 @@ modifer defaults to :I, modes to :$."
        wlimit :writelimit}]
      [(wrapper n rlimit) (wrapper n wlimit) (shifter n) (decrementer n) (incrementer n)])))
 
+(defn load
+  "Load the instruction at the specified position, returning default
+instruction if it's uninitialised."
+  [{:keys [core coredesc]} pc ptr]
+  (let [[_ _ shift _ _] (metrics coredesc)]
+    (or (nth core (shift pc ptr))
+        (:initial coredesc))))
+
 ;; Functions for processing the address resolution and attendant
 ;; pre-decrements / post-increments. These return operations on core
 ;; and "registers" and accept precomputed metric functions as first
@@ -123,48 +134,56 @@ modifer defaults to :I, modes to :$."
 (defn decrements [[_ _ shift decrement _] field]
   {:pre [(#{:a-number :b-number} field)]}
 
-  (fn [core pc rp wp pip]
-    {:pre [(vector? core)]}
-    [(update-in core [(shift pc wp) field] decrement) pc rp wp pip]))
+  (fn [{:keys [core coredesc]} pc rp wp pip]
+    {:pre [(vector? core) coredesc]}
+    (let [state+ (update-in state
+                            [:core (shift pc wp)]
+                            (fnil #(update-in % [field] decrement)
+                                  (:initial coredesc)))]
+      [state+ pc rp wp pip])))
 
 (defn record-increments [[_ _ shift _ _]]
   
-  (fn [core pc rpa wpa pip]
+  (fn [{core :core} pc rpa wpa pip]
     {:pre [(vector? core)]}
-    [core pc rpa wpa (shift pc wpa)]))
+    [state pc rpa wpa (shift pc wpa)]))
 
 (defn follow-indirections [[read-wrap write-wrap shift _ _] field]
   {:pre [(#{:a-number :b-number} field)]}
 
-  (fn [core pc rp wp pip]
-           {:pre [(vector? core)]}
-           [core
-            pc
-            (+ rp (read-wrap (field (nth core (shift pc rp)))))
-            (+ wp (write-wrap (field (nth core (shift pc wp)))))
-            pip]))
+  (fn [{core :core :as state} pc rp wp pip]
+    {:pre [(vector? core)]}
+    [state
+     pc
+     (read-wrap (+ rp (field (load state pc rp))))
+     (write-wrap (+ wp (field (load state pc wp))))
+     pip]))
 
 (defn increments [[_ _ _ _ increment] field]
   {:pre [(#{:a-number :b-number} field)]}
   
-  (fn [core pc rp wp pip]
+  (fn [{:keys [core coredesc]} pc rp wp pip]
     {:pre [(vector? core)]}
-    [(update-in core [pip field] increment) pc rp wp pip]))
+    (let [state+ (update-in state
+                            [:core pip]
+                            (fnil #(update-in % [field] increment)
+                                  (:initial coredesc)))]
+      [state+ pc rp wp pip])))
 
 (defn resolve-references
   "Resolve the approproate read and write pointers from instruction
 ir, updating core where necessary. mode-key is :a-mode or :b-mode and
 number-key is :a-number or :b-number.
-Returns [core read-pointer write-pointer]."
-  [[read-wrap write-wrap :as metrics] core pc mode-key number-key]
+Returns [state read-pointer write-pointer]."
+  [[read-wrap write-wrap :as metrics] {core :core :as state} pc mode-key number-key]
   {:pre [(#{:a-mode :b-mode} mode-key) (#{:a-number :b-number} number-key)]}
-  (let [ir (nth core pc)
+  (let [ir (load state pc 0)
         mode (mode-key ir)]
     (if (= :# mode)
       
-      [core 0 0]                       ; immediate mode self-addresses
+      [state 0 0]                       ; immediate mode self-addresses
       
-      (cond->> [core pc (read-wrap (number-key ir)) (write-wrap (number-key ir)) nil]
+      (cond->> [state pc (read-wrap (number-key ir)) (write-wrap (number-key ir)) nil]
 
                                         ; apply any pre-decrements in the core
                (= :a< mode) (apply (decrements metrics :a-number))
@@ -182,7 +201,7 @@ Returns [core read-pointer write-pointer]."
                (= :> mode) (apply (increments metrics :b-number))
 
                                         ; select out the changed data (core and pointers)
-               true ((fn [[core pc rp wp pip]] [core rp wp]))))))
+               true ((fn [[state pc rp wp pip]] [state rp wp]))))))
 
 ;; opcode execution
 
@@ -199,7 +218,10 @@ Returns [core read-pointer write-pointer]."
 
 (defmethod exec-opcode :mov [state pc ir rpa ira rpb irb wpa wpb]
   (let [[_ _ shift _ increment] (metrics (:coredesc state))
-        mov (fn [src dst state] (assoc-in state [:core (shift pc wpb) dst] (src ira)))
+        mov (fn [src dst state] (assoc-in state
+                                         [:core (shift pc wpb)]
+                                         (let [wrb (load state pc wpb)]
+                                           (assoc wrb dst (src ira)))))
         state (case (:modifier ir)
                 :A  (mov :a-number :a-number state)
                 :B  (mov :b-number :b-number state)
@@ -213,8 +235,11 @@ Returns [core read-pointer write-pointer]."
 (defn lift [op]
   (fn [state pc ir rpa ira rpb irb wpa wpb]
     (let [[_ _ shift _ increment] (metrics (:coredesc state))
-          upd (fn [dst lhs rhs st]
-                (assoc-in st [:core (shift pc wpb) dst] (op (lhs irb) (rhs ira))))
+          upd (fn [dst a-field b-field st]
+                (assoc-in st
+                          [:core (shift pc wpb)]
+                          (let [wrb (load state pc wpb)]
+                            (assoc wrb dst (op (a-field ira) (b-field irb))))))
           state (case (:modifier ir)
                   :A (upd :a-number :a-number :a-number state)
                   :B (upd :b-number :b-number :b-number state)
@@ -240,17 +265,38 @@ Returns [core read-pointer write-pointer]."
 (defmethod exec-opcode :mul [state pc ir rpa ira rpb irb wpa wpb]
   ((lift *) state pc ir rpa ira rpb irb wpa wpb))
 
+(defn lift' [op]
+  (fn [state pc ir rpa ira rpb irb wpa wpb]
+    (let [[_ _ shift _ increment] (metrics (:coredesc state))
+          upd (fn [dst a-field b-field st]
+                (when (not (zero? (b-field ira)))
+                  (assoc-in st
+                            [:core (shift pc wpb)]
+                            (let [wrb (load state pc wpb)]
+                              (assoc wrb dst (op (a-field ira) (b-field irb)))))))
+          state+ (case (:modifier ir)
+                   :A (upd :a-number :a-number :a-number state)
+                   :B (upd :b-number :b-number :b-number state)
+                   :AB (upd :b-number :a-number :b-number state)
+                   :BA (upd :a-number :b-number :a-number state)
+                   :F (some->> state
+                               (upd :a-number :a-number :a-number)
+                               (upd :b-number :b-number :b-number))
+                   :I (some->> state
+                               (upd :a-number :a-number :a-number)
+                               (upd :b-number :b-number :b-number))
+                   :X (some->> state
+                               (upd :b-number :a-number :b-number)
+                               (upd :a-number :b-number :a-number)))]
+      (if state+
+        [state+ [(increment pc)]]
+        [state []]))))
+
 (defmethod exec-opcode :div [state pc ir rpa ira rpb irb wpa wpb]
-  (try
-    ((lift /) state pc ir rpa ira rpb irb wpa wpb)
-    (catch ArithmeticException e ;TODO inelegant and type-dependent, fix
-      [state []])))
+  ((lift' /) state pc ir rpa ira rpb irb wpa wpb))
 
 (defmethod exec-opcode :mod [state pc ir rpa ira rpb irb wpa wpb]
-  (try
-    ((lift mod) state pc ir rpa ira rpb irb wpa wpb)
-    (catch ArithmeticException e ;TODO inelegant and type-dependent, fix
-      [state []])))
+  ((lift' mod) state pc ir rpa ira rpb irb wpa wpb))
 
 (defmethod exec-opcode :jmp [state pc ir rpa ira rpb irb wpa wpb]
   (let [[_ _ shift _ _] (metrics (:coredesc state))]
@@ -272,10 +318,15 @@ Returns [core read-pointer write-pointer]."
 
 (defmethod exec-opcode :djn [state pc ir rpa ira rpb irb wpa wpb]
   (let [[_ _ shift increment decrement] (metrics (:coredesc state))
+        initial (:initial (:coredesc state))
         modifier (:modifier ir)
         state (cond-> state
-                      (#{:A :BA :F :X :I} modifier) (update-in [:core (shift pc wpb :a-number)] decrement)
-                      (#{:B :AB :F :X :I} modifier) (update-in [:core (shift pc wpb :b-number)] decrement))
+                      (#{:A :BA :F :X :I} modifier) (update-in [:core (shift pc wpb)]
+                                                               (fnil #(update-in % :a-number decrement)
+                                                                     initial))
+                      (#{:B :AB :F :X :I} modifier) (update-in [:core (shift pc wpb)]
+                                                               (fnil #(update-in % :b-number decrement)
+                                                                     initial)))
         irb (cond-> irb
                     (#{:A :BA :F :X :I} modifier) (update-in [:a-number] dec)
                     (#{:B :AB :F :X :I} modifier) (update-in [:b-number] dec))]
@@ -322,12 +373,12 @@ Returns [core read-pointer write-pointer]."
         ;; resolve references and pre / post increment base on modes
         ;;
         [read-wrap write-wrap shift :as metrics] (metrics coredesc)
-        [core rpa wpa] (resolve-references metrics core pc :a-mode :a-number)
-        [core rpb wpb] (resolve-references metrics core pc :b-mode :b-number)
+        [state rpa wpa] (resolve-references metrics state pc :a-mode :a-number)
+        [state rpb wpb] (resolve-references metrics state pc :b-mode :b-number)
 
-        ir (nth core pc)
-        ira (nth core (shift pc rpa))
-        irb (nth core (shift pc rpb))
+        ir (load state pc 0)
+        ira (load state pc rpa)
+        irb (load state pc rpb)
 
         ;; pass state and registers to opcode, get new state and
         ;; processes for queue
@@ -387,7 +438,6 @@ random start points."
 
     (first (drop-while #(= (status %) [:ongoing]) (reductions step state turns)))))
 
-
 (def IMP {:name "imp"
           :instructions [(inst :mov 0 1)]
           :start 0})
@@ -398,3 +448,4 @@ random start points."
                            (inst :mov :AB :# 0 :at -2)
                            (inst :jmp :A -2 0)]
             :start 1})
+
